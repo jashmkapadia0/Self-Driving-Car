@@ -1,0 +1,158 @@
+import torch
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import time
+
+# Jetson Nano Camera Configuration
+def gstreamer_pipeline(
+    sensor_id=0,
+    capture_width=1280,
+    capture_height=720,
+    display_width=1280,
+    display_height=720,
+    framerate=30,
+    flip_method=0
+):
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM), width=(int){capture_width}, "
+        f"height=(int){capture_height}, format=(string)NV12, "
+        f"framerate=(fraction){framerate}/1 ! nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
+        f"format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink"
+    )
+
+# Constants for optimization
+CONF_THRESHOLD = 0.45    # Confidence threshold
+IOU_THRESHOLD = 0.45     # NMS IOU threshold
+IMG_SIZE = 640          # Input image size
+FRAME_SKIP = 2          # Process every nth frame
+DANGER_THRESHOLD = 0.6  # Distance threshold for danger zone
+
+class ObjectDetector:
+    def __init__(self):
+        # Model initialization with CUDA optimizations
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        try:
+            self.model = YOLO('yolov5n.pt')  # Lightweight model for Jetson Nano
+            self.model.conf = CONF_THRESHOLD
+            self.model.iou = IOU_THRESHOLD
+            print(f"Model loaded on {self.device}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+
+        # Initialize camera
+        try:
+            self.cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
+            if not self.cap.isOpened():
+                raise RuntimeError("Failed to open CSI camera!")
+        except Exception as e:
+            print(f"CSI camera error: {e}")
+            print("Falling back to USB camera...")
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                raise RuntimeError("No camera available!")
+
+        self.frame_count = 0
+        self.fps_start_time = time.time()
+        self.moving_avg_fps = []
+
+    def calculate_danger_score(self, box):
+        """Calculate danger score based on object size and position"""
+        x1, y1, x2, y2 = map(float, box.xyxy[0])
+        box_area = (x2 - x1) * (y2 - y1)
+        frame_area = IMG_SIZE * IMG_SIZE
+        relative_size = box_area / frame_area
+        center_y = (y2 + y1) / 2
+        vertical_position = center_y / IMG_SIZE
+        return relative_size * (1.5 - vertical_position)
+
+    def process_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return False, None
+
+        self.frame_count += 1
+        if self.frame_count % FRAME_SKIP != 0:
+            return True, None
+
+        # Calculate FPS
+        if time.time() - self.fps_start_time > 1.0:
+            fps = self.frame_count / (time.time() - self.fps_start_time)
+            self.moving_avg_fps.append(fps)
+            if len(self.moving_avg_fps) > 30:
+                self.moving_avg_fps.pop(0)
+            self.frame_count = 0
+            self.fps_start_time = time.time()
+
+        # Resize for consistent processing
+        frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+        
+        # Model inference
+        results = self.model(frame, augment=True)  # Enable test-time augmentation
+        
+        if results and len(results) > 0:
+            result = results[0]
+            boxes = result.boxes
+
+            # Process detections
+            detections = []
+            for box in boxes:
+                label = result.names[int(box.cls)]
+                conf = float(box.conf)
+                danger_score = self.calculate_danger_score(box)
+                detections.append((label, conf, danger_score))
+
+            # Sort by danger score
+            detections.sort(key=lambda x: x[2], reverse=True)
+
+            # Decision making
+            if detections:
+                most_dangerous = detections[0]
+                if most_dangerous[2] > DANGER_THRESHOLD:
+                    if most_dangerous[0] == 'person':
+                        print(f"!! EMERGENCY STOP !! Person detected (Danger: {most_dangerous[2]:.2f})")
+                    elif most_dangerous[0] in ['car', 'truck', 'bus']:
+                        print(f"!! CAUTION !! Vehicle ahead (Danger: {most_dangerous[2]:.2f})")
+                    else:
+                        print(f"!! WARNING !! {most_dangerous[0]} detected (Danger: {most_dangerous[2]:.2f})")
+                else:
+                    print(">> Path Clear (Low danger)")
+
+            # Visualize results
+            annotated_frame = result.plot()
+            
+            # Add performance metrics
+            avg_fps = sum(self.moving_avg_fps) / len(self.moving_avg_fps) if self.moving_avg_fps else 0
+            cv2.putText(annotated_frame, f"FPS: {avg_fps:.1f}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            return True, annotated_frame
+        
+        return True, frame
+
+    def run(self):
+        try:
+            while True:
+                success, frame = self.process_frame()
+                if not success:
+                    break
+                
+                if frame is not None:
+                    cv2.imshow("Jetson Nano Detection", frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    try:
+        detector = ObjectDetector()
+        detector.run()
+    except Exception as e:
+        print(f"Fatal error: {e}")
