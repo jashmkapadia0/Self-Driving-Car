@@ -1,0 +1,117 @@
+sudo apt update && sudo apt upgrade
+sudo apt install python3-pip git cmake
+pip3 install numpy opencv-python imutils
+
+pip3 install torch torchvision torchaudio
+pip3 install matplotlib
+
+git clone https://github.com/ultralytics/yolov5
+cd yolov5
+pip3 install -r requirements.txt
+
+
+import cv2
+cap = cv2.VideoCapture(0)
+while True:
+    ret, frame = cap.read()
+    if ret:
+        cv2.imshow("Cam", frame)
+        if cv2.waitKey(1) == ord('q'):
+            break
+cap.release()
+cv2.destroyAllWindows()
+
+import RPi.GPIO as GPIO
+import time
+
+TRIG = 23
+ECHO = 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+def get_distance():
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    start = time.time()
+    stop = time.time()
+
+    while GPIO.input(ECHO) == 0:
+        start = time.time()
+    while GPIO.input(ECHO) == 1:
+        stop = time.time()
+
+    elapsed = stop - start
+    distance = (elapsed * 34300) / 2
+    return distance
+
+
+import torch
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s')  # smallest version
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    results = model(frame)
+    results.print()
+    results.show()
+
+labels = results.pandas().xyxy[0]['name']
+if 'person' in labels:
+    print("Human detected!")
+
+IN1 = 17
+IN2 = 27
+ENA = 22
+
+GPIO.setup(IN1, GPIO.OUT)
+GPIO.setup(IN2, GPIO.OUT)
+GPIO.setup(ENA, GPIO.OUT)
+
+pwm = GPIO.PWM(ENA, 1000)
+pwm.start(50)
+
+def move_forward():
+    GPIO.output(IN1, True)
+    GPIO.output(IN2, False)
+
+def stop():
+    GPIO.output(IN1, False)
+    GPIO.output(IN2, False)
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    results = model(frame)
+    labels = results.pandas().xyxy[0]['name']
+    distance = get_distance()
+
+    if 'person' in labels or distance < 20:
+        print("Obstacle!")
+        send_command('S')  # or stop()
+    else:
+        send_command('F')  # or move_forward()
+
+sudo nano /etc/systemd/system/selfdrive.service
+
+[Unit]
+Description=Self-Driving Car Script
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/jetson/selfdrive/main.py
+Restart=always
+User=jetson
+
+[Install]
+WantedBy=multi-user.target
+
+sudo systemctl enable selfdrive.service
+
