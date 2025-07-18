@@ -4,13 +4,20 @@ import numpy as np
 from ultralytics import YOLO
 import time
 
-# Jetson Nano Camera Configuration
+# Constants for optimization - Modified for better performance
+CONF_THRESHOLD = 0.5     # Increased to reduce false positives
+IOU_THRESHOLD = 0.5      # Increased for faster NMS
+IMG_SIZE = 416           # Reduced from 640 for faster processing
+FRAME_SKIP = 3          # Increased frame skip
+DANGER_THRESHOLD = 0.6
+MAX_BATCH_SIZE = 1      # Limit batch size
+
 def gstreamer_pipeline(
     sensor_id=0,
-    capture_width=1280,
-    capture_height=720,
-    display_width=1280,
-    display_height=720,
+    capture_width=640,   # Reduced capture resolution
+    capture_height=480,  # Reduced capture resolution
+    display_width=640,   # Reduced display resolution
+    display_height=480,  # Reduced display resolution
     framerate=30,
     flip_method=0
 ):
@@ -20,30 +27,25 @@ def gstreamer_pipeline(
         f"height=(int){capture_height}, format=(string)NV12, "
         f"framerate=(fraction){framerate}/1 ! nvvidconv flip-method={flip_method} ! "
         f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
-        f"format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink"
+        f"format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink drop=1"  # Added drop=1
     )
-
-# Constants for optimization
-CONF_THRESHOLD = 0.45    # Confidence threshold
-IOU_THRESHOLD = 0.45     # NMS IOU threshold
-IMG_SIZE = 640          # Input image size
-FRAME_SKIP = 2          # Process every nth frame
-DANGER_THRESHOLD = 0.6  # Distance threshold for danger zone
 
 class ObjectDetector:
     def __init__(self):
-        # Model initialization with CUDA optimizations
+        # Model initialization with optimizations
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         try:
-            self.model = YOLO('yolov5n.pt')  # Lightweight model for Jetson Nano
+            self.model = YOLO('yolov5n.pt')  # Using smallest model
             self.model.conf = CONF_THRESHOLD
             self.model.iou = IOU_THRESHOLD
+            if torch.cuda.is_available():
+                self.model.half()  # FP16 inference
             print(f"Model loaded on {self.device}")
         except Exception as e:
             print(f"Error loading model: {e}")
             raise
 
-        # Initialize camera
+        # Initialize camera with optimized settings
         try:
             self.cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
             if not self.cap.isOpened():
@@ -52,22 +54,14 @@ class ObjectDetector:
             print(f"CSI camera error: {e}")
             print("Falling back to USB camera...")
             self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             if not self.cap.isOpened():
                 raise RuntimeError("No camera available!")
 
         self.frame_count = 0
         self.fps_start_time = time.time()
         self.moving_avg_fps = []
-
-    def calculate_danger_score(self, box):
-        """Calculate danger score based on object size and position"""
-        x1, y1, x2, y2 = map(float, box.xyxy[0])
-        box_area = (x2 - x1) * (y2 - y1)
-        frame_area = IMG_SIZE * IMG_SIZE
-        relative_size = box_area / frame_area
-        center_y = (y2 + y1) / 2
-        vertical_position = center_y / IMG_SIZE
-        return relative_size * (1.5 - vertical_position)
 
     def process_frame(self):
         ret, frame = self.cap.read()
@@ -76,62 +70,60 @@ class ObjectDetector:
 
         self.frame_count += 1
         if self.frame_count % FRAME_SKIP != 0:
-            return True, None
+            return True, frame  # Return original frame without processing
 
-        # Calculate FPS
-        if time.time() - self.fps_start_time > 1.0:
-            fps = self.frame_count / (time.time() - self.fps_start_time)
-            self.moving_avg_fps.append(fps)
-            if len(self.moving_avg_fps) > 30:
-                self.moving_avg_fps.pop(0)
-            self.frame_count = 0
-            self.fps_start_time = time.time()
-
-        # Resize for consistent processing
+        # Optimize frame preprocessing
         frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
         
-        # Model inference
-        results = self.model(frame, augment=True)  # Enable test-time augmentation
+        # Model inference with optimizations
+        results = self.model(frame, 
+                           augment=False,  # Disabled augmentation
+                           half=True if torch.cuda.is_available() else False,  # FP16
+                           max_det=10)     # Limit maximum detections
         
         if results and len(results) > 0:
             result = results[0]
             boxes = result.boxes
 
-            # Process detections
-            detections = []
-            for box in boxes:
-                label = result.names[int(box.cls)]
-                conf = float(box.conf)
-                danger_score = self.calculate_danger_score(box)
-                detections.append((label, conf, danger_score))
+            # Simplified detection processing
+            if len(boxes) > 0:
+                # Get only the most dangerous object
+                most_dangerous = None
+                max_danger = 0
+                
+                for box in boxes:
+                    label = result.names[int(box.cls)]
+                    if label in ['person', 'car', 'truck', 'bus']:  # Only process critical objects
+                        danger_score = self.calculate_danger_score(box)
+                        if danger_score > max_danger:
+                            max_danger = danger_score
+                            most_dangerous = (label, float(box.conf), danger_score)
 
-            # Sort by danger score
-            detections.sort(key=lambda x: x[2], reverse=True)
+                if most_dangerous:
+                    label, conf, danger = most_dangerous
+                    if danger > DANGER_THRESHOLD:
+                        print(f"!! WARNING !! {label} (Danger: {danger:.2f})")
 
-            # Decision making
-            if detections:
-                most_dangerous = detections[0]
-                if most_dangerous[2] > DANGER_THRESHOLD:
-                    if most_dangerous[0] == 'person':
-                        print(f"!! EMERGENCY STOP !! Person detected (Danger: {most_dangerous[2]:.2f})")
-                    elif most_dangerous[0] in ['car', 'truck', 'bus']:
-                        print(f"!! CAUTION !! Vehicle ahead (Danger: {most_dangerous[2]:.2f})")
-                    else:
-                        print(f"!! WARNING !! {most_dangerous[0]} detected (Danger: {most_dangerous[2]:.2f})")
-                else:
-                    print(">> Path Clear (Low danger)")
-
-            # Visualize results
-            annotated_frame = result.plot()
+            # Quick visualization
+            annotated_frame = result.plot(conf=False)  # Disable confidence display for speed
             
-            # Add performance metrics
-            avg_fps = sum(self.moving_avg_fps) / len(self.moving_avg_fps) if self.moving_avg_fps else 0
-            cv2.putText(annotated_frame, f"FPS: {avg_fps:.1f}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            # Calculate FPS
+            if time.time() - self.fps_start_time > 1.0:
+                fps = self.frame_count / (time.time() - self.fps_start_time)
+                self.frame_count = 0
+                self.fps_start_time = time.time()
+                cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
             return True, annotated_frame
         
         return True, frame
+
+    def calculate_danger_score(self, box):
+        """Simplified danger score calculation"""
+        x1, y1, x2, y2 = map(float, box.xyxy[0])
+        box_area = (x2 - x1) * (y2 - y1)
+        return box_area / (IMG_SIZE * IMG_SIZE)
 
     def run(self):
         try:
