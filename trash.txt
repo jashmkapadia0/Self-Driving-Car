@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/home/aiml/Desktop/ObjectDetection/yolojash.py", line 246, in <module>
+    main()
+  File "/home/aiml/Desktop/ObjectDetection/yolojash.py", line 224, in main
+    boxes, scores, class_ids, inference_time = model.inference(frame)
+  File "/home/aiml/Desktop/ObjectDetection/yolojash.py", line 168, in inference
+    boxes, scores, class_ids = self.postprocess(output, h, w)
+  File "/home/aiml/Desktop/ObjectDetection/yolojash.py", line 107, in postprocess
+    return boxes[keep], scores[keep], class_ids[keep]
+IndexError: arrays used as indices must be of integer (or boolean) type
+[07/25/2025-23:23:43] [TRT] [E] 1: [defaultAllocator.cpp::deallocate::35] Error Code 1: Cuda Runtime (invalid argument)
+Segmentation fault (core dumped)
