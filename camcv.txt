@@ -1,0 +1,5 @@
+cap = cv2.VideoCapture(0)  
+frameWidth = 640
+frameHeight = 480
+cap.set(3, frameWidth)
+cap.set(4, frameHeight)
